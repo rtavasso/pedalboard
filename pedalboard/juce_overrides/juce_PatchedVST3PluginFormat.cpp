@@ -26,6 +26,8 @@
 #define JUCE_GUI_BASICS_INCLUDE_XHEADERS 1
 #define JUCE_GUI_BASICS_INCLUDE_SCOPED_THREAD_DPI_AWARENESS_SETTER 1
 
+#include <iostream>
+
 #include "juce_PatchedVST3PluginFormat.h"
 
 #include "../../JUCE/modules/juce_audio_processors/juce_audio_processors.h"
@@ -914,30 +916,55 @@ struct DescriptionFactory {
   virtual ~DescriptionFactory() {}
 
   Result findDescriptionsAndPerform(const File &file) {
+    std::cerr << "[DEBUG VST3 DescFactory] Entering findDescriptionsAndPerform for file: " << file.getFullPathName().toStdString() << std::endl;
     StringArray foundNames;
     PFactoryInfo factoryInfo;
+
+    if (factory == nullptr) {
+        std::cerr << "[DEBUG VST3 DescFactory] CRITICAL: Factory pointer is NULL. Cannot proceed." << std::endl;
+        return Result::fail("Plugin factory is null");
+    }
+
+    std::cerr << "[DEBUG VST3 DescFactory] Getting factory info..." << std::endl;
     factory->getFactoryInfo(&factoryInfo);
     auto companyName = toString(factoryInfo.vendor).trim();
+    std::cerr << "[DEBUG VST3 DescFactory] Factory Vendor: " << companyName.toStdString() << std::endl;
 
     Result result(Result::ok());
 
+    std::cerr << "[DEBUG VST3 DescFactory] Counting classes..." << std::endl;
     auto numClasses = factory->countClasses();
+    std::cerr << "[DEBUG VST3 DescFactory] Found " << numClasses << " classes." << std::endl;
 
     for (Steinberg::int32 i = 0; i < numClasses; ++i) {
+      std::cerr << "[DEBUG VST3 DescFactory] --- Processing Class Index: " << i << " ---" << std::endl;
       PClassInfo info;
-      factory->getClassInfo(i, &info);
+      std::cerr << "[DEBUG VST3 DescFactory] Getting class info for index " << i << "..." << std::endl;
+      tresult infoResult = factory->getClassInfo(i, &info);
+      if (infoResult != kResultOk) {
+          std::cerr << "[DEBUG VST3 DescFactory] Failed to get class info for index " << i << ". Result: " << infoResult << std::endl;
+          continue;
+      }
+       std::cerr << "[DEBUG VST3 DescFactory] Class Name: " << toString(info.name).trim().toStdString() << ", Category: " << info.category << std::endl;
 
-      if (std::strcmp(info.category, kVstAudioEffectClass) != 0)
-        continue;
+      if (std::strcmp(info.category, kVstAudioEffectClass) != 0) {
+          std::cerr << "[DEBUG VST3 DescFactory] Skipping class - Category is not kVstAudioEffectClass." << std::endl;
+          continue;
+      }
 
       const String name(toString(info.name).trim());
 
-      if (foundNames.contains(name, true))
-        continue;
+      if (foundNames.contains(name, true)) {
+          std::cerr << "[DEBUG VST3 DescFactory] Skipping class - Name '" << name.toStdString() << "' already processed (shell plugin)." << std::endl;
+          continue;
+      }
+
+      std::cerr << "[DEBUG VST3 DescFactory] Processing class '" << name.toStdString() << "'" << std::endl;
 
       std::unique_ptr<PClassInfo2> info2;
       std::unique_ptr<PClassInfoW> infoW;
 
+      // Optional: Add logging for Factory2/3 if needed, but less likely the issue source
       {
         VSTComSmartPtr<IPluginFactory2> pf2;
         VSTComSmartPtr<IPluginFactory3> pf3;
@@ -945,49 +972,88 @@ struct DescriptionFactory {
         if (pf2.loadFrom(factory)) {
           info2.reset(new PClassInfo2());
           pf2->getClassInfo2(i, info2.get());
+           std::cerr << "[DEBUG VST3 DescFactory] Got PClassInfo2." << std::endl;
         }
 
         if (pf3.loadFrom(factory)) {
           infoW.reset(new PClassInfoW());
           pf3->getClassInfoUnicode(i, infoW.get());
+          std::cerr << "[DEBUG VST3 DescFactory] Got PClassInfoW." << std::endl;
         }
       }
 
       foundNames.add(name);
 
       PluginDescription desc;
+      bool descriptionCreated = false;
 
       {
         VSTComSmartPtr<Vst::IComponent> component;
+        std::cerr << "[DEBUG VST3 DescFactory] Attempting to load IComponent for class '" << name.toStdString() << "'..." << std::endl;
+        // Note: component.loadFrom doesn't directly return tresult easily here
+        component.loadFrom(factory, info.cid);
 
-        if (component.loadFrom(factory, info.cid)) {
-          if (component->initialize(Patchedvst3HostContext->getFUnknown()) ==
-              kResultOk) {
-            auto numInputs =
-                getNumSingleDirectionChannelsFor(component, true, true);
-            auto numOutputs =
-                getNumSingleDirectionChannelsFor(component, false, true);
+        if (component != nullptr) {
+            std::cerr << "[DEBUG VST3 DescFactory] IComponent loaded successfully. Pointer: " << component.get() << std::endl;
+            std::cerr << "[DEBUG VST3 DescFactory] Initializing IComponent..." << std::endl;
 
-            createPluginDescription(desc, file, companyName, name, info,
-                                    info2.get(), infoW.get(), numInputs,
-                                    numOutputs);
+            if (Patchedvst3HostContext == nullptr) {
+                 std::cerr << "[DEBUG VST3 DescFactory] CRITICAL: Patchedvst3HostContext is NULL during component initialize!" << std::endl;
+                 component = nullptr; // Prevent further use
+            } else if (Patchedvst3HostContext->getFUnknown() == nullptr) {
+                 std::cerr << "[DEBUG VST3 DescFactory] CRITICAL: Patchedvst3HostContext->getFUnknown() is NULL during component initialize!" << std::endl;
+                 component = nullptr; // Prevent further use
+            } else {
+                tresult initResult = component->initialize(Patchedvst3HostContext->getFUnknown());
+                std::cerr << "[DEBUG VST3 DescFactory] IComponent initialize result: " << initResult << (initResult == kResultOk ? " (kResultOk)" : " (FAILED)") << std::endl;
 
-            component->terminate();
-          } else {
-            jassertfalse;
-          }
+                if (initResult == kResultOk) {
+                    std::cerr << "[DEBUG VST3 DescFactory] Getting channel counts..." << std::endl;
+                    auto numInputs =
+                        getNumSingleDirectionChannelsFor(component, true, true);
+                    auto numOutputs =
+                        getNumSingleDirectionChannelsFor(component, false, true);
+                    std::cerr << "[DEBUG VST3 DescFactory] Inputs: " << numInputs << ", Outputs: " << numOutputs << std::endl;
+
+                    std::cerr << "[DEBUG VST3 DescFactory] Creating PluginDescription..." << std::endl;
+                    createPluginDescription(desc, file, companyName, name, info,
+                                            info2.get(), infoW.get(), numInputs,
+                                            numOutputs);
+                    descriptionCreated = true;
+                     std::cerr << "[DEBUG VST3 DescFactory] PluginDescription created. Unique ID: " << desc.uniqueId << std::endl;
+
+                    std::cerr << "[DEBUG VST3 DescFactory] Terminating IComponent..." << std::endl;
+                    component->terminate();
+                     std::cerr << "[DEBUG VST3 DescFactory] IComponent terminated." << std::endl;
+                } else {
+                    std::cerr << "[DEBUG VST3 DescFactory] IComponent initialization failed. Skipping description creation." << std::endl;
+                    jassertfalse; // Keep assertion
+                }
+            }
         } else {
-          jassertfalse;
+            std::cerr << "[DEBUG VST3 DescFactory] Failed to load IComponent for class '" << name.toStdString() << "'." << std::endl;
+            jassertfalse; // Keep assertion
         }
+      } // component goes out of scope here
+
+      if (descriptionCreated && desc.uniqueId != 0) {
+           std::cerr << "[DEBUG VST3 DescFactory] Performing action on description for '" << name.toStdString() << "'..." << std::endl;
+           result = performOnDescription(desc); // performOnDescription is virtual, could be DescriptionLister's version
+           std::cerr << "[DEBUG VST3 DescFactory] performOnDescription result: " << (result.wasOk() ? "OK" : "FAILED") << std::endl;
+      } else if (!descriptionCreated) {
+            std::cerr << "[DEBUG VST3 DescFactory] Skipping performOnDescription because description was not created." << std::endl;
+      } else {
+            std::cerr << "[DEBUG VST3 DescFactory] Skipping performOnDescription because uniqueId is 0." << std::endl;
       }
 
-      if (desc.uniqueId != 0)
-        result = performOnDescription(desc);
-
-      if (result.failed())
-        break;
+      if (result.failed()) {
+          std::cerr << "[DEBUG VST3 DescFactory] Result failed, breaking class loop." << std::endl;
+          break;
+      }
+       std::cerr << "[DEBUG VST3 DescFactory] --- Finished Class Index: " << i << " ---" << std::endl;
     }
 
+     std::cerr << "[DEBUG VST3 DescFactory] Exiting findDescriptionsAndPerform. Final result: " << (result.wasOk() ? "OK" : "FAILED") << std::endl;
     return result;
   }
 
@@ -1044,14 +1110,27 @@ struct DLLHandle {
      be handled by this DLLHandle.
   */
   IPluginFactory *JUCE_CALLTYPE getPluginFactory() {
-    if (factory == nullptr)
-      if (auto *proc = (GetFactoryProc)getFunction(factoryFnName))
-        factory = proc();
+    std::cerr << "[DEBUG VST3 DLLHandle] Entering getPluginFactory(). Current factory pointer: " << factory << std::endl;
+    if (factory == nullptr) {
+        std::cerr << "[DEBUG VST3 DLLHandle] Factory is null. Attempting to get function: " << factoryFnName << std::endl;
+        if (auto *proc = (GetFactoryProc)getFunction(factoryFnName)) {
+            std::cerr << "[DEBUG VST3 DLLHandle] Function '" << factoryFnName << "' found. Calling it..." << std::endl;
+            factory = proc();
+            std::cerr << "[DEBUG VST3 DLLHandle] Function '" << factoryFnName << "' returned factory pointer: " << factory << std::endl;
+        } else {
+            std::cerr << "[DEBUG VST3 DLLHandle] Function '" << factoryFnName << "' NOT found." << std::endl;
+        }
+    } else {
+         std::cerr << "[DEBUG VST3 DLLHandle] Factory pointer already exists." << std::endl;
+    }
 
     // The plugin NEEDS to provide a factory to be able to be called a VST3!
     // Most likely you are trying to load a 32-bit VST3 from a 64-bit host
     // or vice versa.
-    jassert(factory != nullptr);
+    if (factory == nullptr) {
+        std::cerr << "[DEBUG VST3 DLLHandle] CRITICAL: Factory pointer is NULL after attempting retrieval. VST3 cannot be loaded." << std::endl;
+    }
+    jassert(factory != nullptr); // Keep the assertion for debug builds
     return factory;
   }
 
@@ -1097,21 +1176,36 @@ private:
   DynamicLibrary library;
 
   bool open() {
+    std::cerr << "[DEBUG VST3 DLLHandle] Attempting to open library: " << dllFile.getFullPathName().toStdString() << std::endl;
     if (library.open(dllFile.getFullPathName())) {
-      if (auto *proc = (EntryProc)getFunction(entryFnName)) {
+        std::cerr << "[DEBUG VST3 DLLHandle] Library opened successfully." << std::endl;
+        std::cerr << "[DEBUG VST3 DLLHandle] Attempting to get entry function: " << entryFnName << std::endl;
+        if (auto *proc = (EntryProc)getFunction(entryFnName)) {
+            std::cerr << "[DEBUG VST3 DLLHandle] Entry function found. Calling it..." << std::endl;
 #if JUCE_WINDOWS
-        if (proc())
+            bool entryResult = proc();
+            std::cerr << "[DEBUG VST3 DLLHandle] Entry function returned: " << (entryResult ? "true" : "false") << std::endl;
+            if (entryResult)
+                return true;
 #else
-        if (proc(library.getNativeHandle()))
+            bool entryResult = proc(library.getNativeHandle());
+            std::cerr << "[DEBUG VST3 DLLHandle] Entry function returned: " << (entryResult ? "true" : "false") << std::endl;
+            if (entryResult)
+                return true;
 #endif
-          return true;
-      } else {
-        // this is required for some plug-ins which don't export the dll entry
-        // point function
-        return true;
+        } else {
+            std::cerr << "[DEBUG VST3 DLLHandle] Entry function '" << entryFnName << "' not found. Assuming success (required for some plugins)." << std::endl;
+            // this is required for some plug-ins which don't export the dll entry
+            // point function
+            return true;
       }
 
+      std::cerr << "[DEBUG VST3 DLLHandle] Entry function call failed or returned false. Closing library." << std::endl;
       library.close();
+    } else {
+        std::cerr << "[DEBUG VST3 DLLHandle] Failed to open library." << std::endl;
+        // Optionally log the error message if DynamicLibrary provides one
+        // std::cerr << "[DEBUG VST3 DLLHandle] Error: " << library.getLastError().toStdString() << std::endl;
     }
 
     return false;
@@ -1120,30 +1214,58 @@ private:
   CFUniquePtr<CFBundleRef> bundleRef;
 
   bool open() {
-    auto *utf8 = dllFile.getFullPathName().toRawUTF8();
+    auto pathStr = dllFile.getFullPathName();
+    std::cerr << "[DEBUG VST3 DLLHandle] Attempting to open bundle: " << pathStr.toStdString() << std::endl;
+    auto *utf8 = pathStr.toRawUTF8();
 
     if (auto url =
             CFUniquePtr<CFURLRef>(CFURLCreateFromFileSystemRepresentation(
                 nullptr, (const UInt8 *)utf8, (CFIndex)std::strlen(utf8),
                 dllFile.isDirectory()))) {
-      bundleRef.reset(CFBundleCreate(kCFAllocatorDefault, url.get()));
+        std::cerr << "[DEBUG VST3 DLLHandle] Created URL from path." << std::endl;
+        bundleRef.reset(CFBundleCreate(kCFAllocatorDefault, url.get()));
 
-      if (bundleRef != nullptr) {
-        CFObjectHolder<CFErrorRef> error;
+        if (bundleRef != nullptr) {
+            std::cerr << "[DEBUG VST3 DLLHandle] Created bundle reference." << std::endl;
+            CFObjectHolder<CFErrorRef> error;
 
-        if (CFBundleLoadExecutableAndReturnError(bundleRef.get(),
-                                                 &error.object))
-          if (auto *proc = (EntryProc)getFunction(entryFnName))
-            if (proc(bundleRef.get()))
-              return true;
+            std::cerr << "[DEBUG VST3 DLLHandle] Attempting to load executable..." << std::endl;
+            if (CFBundleLoadExecutableAndReturnError(bundleRef.get(), &error.object))
+            {
+                std::cerr << "[DEBUG VST3 DLLHandle] Executable loaded successfully." << std::endl;
+                std::cerr << "[DEBUG VST3 DLLHandle] Attempting to get entry function: " << entryFnName << std::endl;
+                if (auto *proc = (EntryProc)getFunction(entryFnName))
+                {
+                    std::cerr << "[DEBUG VST3 DLLHandle] Entry function found. Calling it..." << std::endl;
+                    bool entryResult = proc(bundleRef.get());
+                    std::cerr << "[DEBUG VST3 DLLHandle] Entry function returned: " << (entryResult ? "true" : "false") << std::endl;
+                    if (entryResult)
+                        return true;
+                    else
+                         std::cerr << "[DEBUG VST3 DLLHandle] Entry function returned false." << std::endl;
+                } else {
+                    std::cerr << "[DEBUG VST3 DLLHandle] Entry function '" << entryFnName << "' not found." << std::endl;
+                     // Unlike Windows/Linux, macOS VST3 generally requires the entry point? Check VST3 SDK docs if needed.
+                     // For now, assume failure if entry point missing after successful load.
+                }
+            } else {
+                 std::cerr << "[DEBUG VST3 DLLHandle] Failed to load executable." << std::endl;
+                 if (error.object != nullptr) {
+                    if (auto failureMessage = CFUniquePtr<CFStringRef>(CFErrorCopyFailureReason(error.object))) {
+                        std::cerr << "[DEBUG VST3 DLLHandle] Error: " << String::fromCFString(failureMessage.get()).toStdString() << std::endl;
+                    } else {
+                         std::cerr << "[DEBUG VST3 DLLHandle] Error: Unknown CFBundleLoadExecutable error." << std::endl;
+                    }
+                 }
+            }
 
-        if (error.object != nullptr)
-          if (auto failureMessage = CFUniquePtr<CFStringRef>(
-                  CFErrorCopyFailureReason(error.object)))
-            DBG(String::fromCFString(failureMessage.get()));
-
-        bundleRef = nullptr;
-      }
+            std::cerr << "[DEBUG VST3 DLLHandle] Bundle load/entry point failed. Resetting bundle reference." << std::endl;
+            bundleRef = nullptr; // Ensure it's null on failure path
+        } else {
+            std::cerr << "[DEBUG VST3 DLLHandle] Failed to create bundle reference (CFBundleCreate returned null)." << std::endl;
+        }
+    } else {
+         std::cerr << "[DEBUG VST3 DLLHandle] Failed to create URL from path." << std::endl;
     }
 
     return false;
@@ -3645,28 +3767,69 @@ bool PatchedVST3PluginFormat::setStateFromVSTPresetFile(
 
 void PatchedVST3PluginFormat::findAllTypesForFile(
     OwnedArray<PluginDescription> &results, const String &fileOrIdentifier) {
+
+  std::cerr << "[DEBUG VST3 Format] Entering findAllTypesForFile for: " << fileOrIdentifier.toStdString() << std::endl;
+
   if (fileMightContainThisPluginType(fileOrIdentifier)) {
+    std::cerr << "[DEBUG VST3 Format] File identified as potential VST3: " << fileOrIdentifier.toStdString() << std::endl;
     /**
         Since there is no apparent indication if a VST3 plugin is a shell or
        not, we're stuck iterating through a VST3's factory, creating a
        description for every housed plugin.
     */
 
-    VSTComSmartPtr<IPluginFactory> pluginFactory(
-        DLLHandleCache::getInstance()
-            ->findOrCreateHandle(fileOrIdentifier)
-            .getPluginFactory());
+    std::cerr << "[DEBUG VST3 Format] Attempting to get/create DLL handle and plugin factory..." << std::endl;
+    DLLHandle* dllHandle = nullptr; // Raw pointer to check validity before getting factory
+    IPluginFactory* rawFactory = nullptr; // Raw pointer to check result
+
+    try {
+        dllHandle = &(DLLHandleCache::getInstance()->findOrCreateHandle(fileOrIdentifier));
+        if (dllHandle) {
+             std::cerr << "[DEBUG VST3 Format] DLL Handle obtained/created. Attempting to get factory..." << std::endl;
+             rawFactory = dllHandle->getPluginFactory(); // This now has internal logging
+        } else {
+            std::cerr << "[DEBUG VST3 Format] CRITICAL: Failed to obtain DLL Handle." << std::endl;
+        }
+    } catch (const std::exception& e) {
+         std::cerr << "[DEBUG VST3 Format] EXCEPTION during DLL handle/factory retrieval: " << e.what() << std::endl;
+         rawFactory = nullptr; // Ensure it's null on exception
+    } catch (...) {
+         std::cerr << "[DEBUG VST3 Format] UNKNOWN EXCEPTION during DLL handle/factory retrieval." << std::endl;
+         rawFactory = nullptr; // Ensure it's null on exception
+    }
+
+
+    VSTComSmartPtr<IPluginFactory> pluginFactory(rawFactory); // Wrap in smart pointer AFTER checking raw pointer
 
     if (pluginFactory != nullptr) {
+      std::cerr << "[DEBUG VST3 Format] Plugin factory obtained successfully. Pointer: " << pluginFactory.get() << std::endl;
+      std::cerr << "[DEBUG VST3 Format] Creating PatchedVST3HostContext..." << std::endl;
       VSTComSmartPtr<PatchedVST3HostContext> host(new PatchedVST3HostContext());
+      if (host == nullptr) {
+          std::cerr << "[DEBUG VST3 Format] CRITICAL: Failed to create PatchedVST3HostContext!" << std::endl;
+          return; // Cannot proceed without host context
+      }
+       std::cerr << "[DEBUG VST3 Format] PatchedVST3HostContext created. Pointer: " << host.get() << std::endl;
+
+      std::cerr << "[DEBUG VST3 Format] Creating DescriptionLister..." << std::endl;
       DescriptionLister lister(host, pluginFactory);
-      lister.findDescriptionsAndPerform(File(fileOrIdentifier));
+      std::cerr << "[DEBUG VST3 Format] DescriptionLister created. Calling findDescriptionsAndPerform..." << std::endl;
+
+      Result findResult = lister.findDescriptionsAndPerform(File(fileOrIdentifier)); // This now has internal logging
+      std::cerr << "[DEBUG VST3 Format] findDescriptionsAndPerform finished. Result: " << (findResult.wasOk() ? "OK" : "FAILED") << std::endl;
+      std::cerr << "[DEBUG VST3 Format] Number of descriptions found by lister: " << lister.list.size() << std::endl;
 
       results.addCopiesOf(lister.list);
+      std::cerr << "[DEBUG VST3 Format] Added " << lister.list.size() << " descriptions to results array." << std::endl;
+
     } else {
-      jassertfalse;
+      std::cerr << "[DEBUG VST3 Format] Failed to obtain plugin factory. Cannot scan plugin." << std::endl;
+      jassertfalse; // Keep assertion
     }
+  } else {
+       std::cerr << "[DEBUG VST3 Format] File does not appear to be a VST3 (based on extension/existence check): " << fileOrIdentifier.toStdString() << std::endl;
   }
+   std::cerr << "[DEBUG VST3 Format] Exiting findAllTypesForFile for: " << fileOrIdentifier.toStdString() << std::endl;
 }
 
 void PatchedVST3PluginFormat::createPluginInstance(
@@ -3711,13 +3874,34 @@ bool PatchedVST3PluginFormat::requiresUnblockedMessageThreadDuringCreation(
 
 bool PatchedVST3PluginFormat::fileMightContainThisPluginType(
     const String &fileOrIdentifier) {
+  // Add logging inside this function too for clarity
+  std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Checking path: " << fileOrIdentifier.toStdString() << std::endl;
   auto f = File::createFileWithoutCheckingPath(fileOrIdentifier);
 
-  return f.hasFileExtension(".vst3")
+  bool hasExtension = f.hasFileExtension(".vst3");
+  std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Has '.vst3' extension? " << (hasExtension ? "Yes" : "No") << std::endl;
+
+  if (!hasExtension) {
+      std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Result: false (bad extension)" << std::endl;
+      return false;
+  }
+
 #if JUCE_MAC || JUCE_LINUX || JUCE_BSD
-         && f.exists();
-#else
-         && f.existsAsFile();
+  bool existsCheck = f.exists();
+  std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Checking f.exists() on Mac/Linux/BSD... Result: " << (existsCheck ? "Yes" : "No") << std::endl;
+  bool finalResult = hasExtension && existsCheck;
+  std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Final Result: " << (finalResult ? "true" : "false") << std::endl;
+  return finalResult;
+#else // Windows
+  // ***** CHANGE HERE: Use f.exists() instead of f.existsAsFile() for Windows *****
+  bool existsCheck = f.exists();
+  std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Checking f.exists() on Windows... Result: " << (existsCheck ? "Yes" : "No") << std::endl;
+  // Original check was: bool existsCheck = f.existsAsFile();
+  // std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Checking f.existsAsFile() on Windows... Result: " << (existsCheck ? "Yes" : "No") << std::endl;
+
+  bool finalResult = hasExtension && existsCheck;
+  std::cerr << "[DEBUG VST3 fileMightContainThisPluginType] Final Result: " << (finalResult ? "true" : "false") << std::endl;
+  return finalResult;
 #endif
 }
 
